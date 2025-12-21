@@ -1,0 +1,2 @@
+echo "hello" | gzip | curl -X POST -H "Content-Encoding:gzip"  http://127.0.0.1:8080/api/user/register --data-binary @- -v
+curl -X POST -H "Accept-Encoding: gzip"  127.0.0.1:8080/api/user/register -v --data {} --compressed
