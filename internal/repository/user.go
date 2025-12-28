@@ -10,11 +10,21 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/TheLuckymadman/gophermart/internal/models"
+	"github.com/TheLuckymadman/gophermart/internal/app"
 )
 
-func (p *PGStorage) CreateUser(ctx context.Context, login string, hash string) (int, error) {
+type UserRepo struct {
+	db  *sql.DB
+	app *app.App
+}
+
+func NewUserRepo(db *sql.DB, app *app.App) *UserRepo {
+	return &UserRepo{db: db, app: app}
+}
+
+func (r *UserRepo) CreateUser(ctx context.Context, login string, hash string) (int, error) {
 	var id int
-	err := p.DB.QueryRowContext(ctx, `INSERT INTO users (login, password)
+	err := r.db.QueryRowContext(ctx, `INSERT INTO users (login, password)
 		VALUES ($1, $2)
 		RETURNING id
 		`, login, hash).Scan(&id)
@@ -24,8 +34,8 @@ func (p *PGStorage) CreateUser(ctx context.Context, login string, hash string) (
 	return id, nil
 }
 
-func (p *PGStorage) GetUser(ctx context.Context, login string) (*models.Users, error) {
-	row := p.DB.QueryRowContext(ctx, `SELECT id, login, password
+func (r *UserRepo) GetUser(ctx context.Context, login string) (*models.Users, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT id, login, password
 		FROM users
 		WHERE login = $1`, login)
 	u := models.Users{}

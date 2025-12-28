@@ -10,10 +10,10 @@ import (
 
 type OrderService struct {
 	app *app.App
-	db  Storage
+	db  OrderStorage
 }
 
-func NewOrderService(app *app.App, db Storage) *OrderService {
+func NewOrderService(app *app.App, db OrderStorage) *OrderService {
 	return &OrderService{app: app, db: db}
 }
 

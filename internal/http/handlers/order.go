@@ -10,9 +10,9 @@ import (
 
 	"github.com/TheLuckymadman/gophermart/internal/app"
 	"github.com/TheLuckymadman/gophermart/internal/apperrors"
+	"github.com/TheLuckymadman/gophermart/internal/http/helpers"
 	"github.com/TheLuckymadman/gophermart/internal/http/middleware"
 	"github.com/TheLuckymadman/gophermart/internal/models"
-	"github.com/TheLuckymadman/gophermart/internal/utils"
 
 	"go.uber.org/zap"
 )
@@ -28,8 +28,7 @@ func NewOHandler(a *app.App, srv OrderService) *OHandler {
 
 func (h *OHandler) NewOrder(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(r.Header.Get("Content-Type"), "text/plain") {
-		h.app.Logger.Warn("wrong content type", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "wrong content type, use text/plain", http.StatusBadRequest)
+		helpers.WriteError(h.app.Logger, w, r, "warn", "wrong content type, use text/plain", http.StatusBadRequest, nil)
 		return
 	}
 	ctx := r.Context()
@@ -40,16 +39,14 @@ func (h *OHandler) NewOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		h.app.Logger.Warn("cannot read order number from body", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "cannot read order number from body", http.StatusBadRequest)
+		helpers.WriteError(h.app.Logger, w, r, "warn", "cannot read order number from body", http.StatusBadRequest, err)
 		return
 	}
 	number := strings.TrimSpace(string(body))
-	ok, err = utils.CheckNumber(number)
+	ok, err = helpers.CheckNumber(number)
 	if !ok {
-		h.app.Logger.Warn("incorrect order number", zap.String("source ip", r.RemoteAddr), zap.Error(err))
 		errMsg := fmt.Sprintf("incorrect order number: %v", err)
-		http.Error(w, errMsg, http.StatusUnprocessableEntity)
+		helpers.WriteError(h.app.Logger, w, r, "warn", errMsg, http.StatusUnprocessableEntity, nil)
 		return
 	}
 	h.app.Logger.Info(
@@ -67,13 +64,11 @@ func (h *OHandler) NewOrder(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	case errors.Is(err, apperrors.ErrAnotherUserAlreadyHasOrder):
-		h.app.Logger.Warn("incorrect order number", zap.String("source ip", r.RemoteAddr), zap.Error(err))
 		warnMsg := fmt.Sprintf("another user already has an order with this number: %v", err)
-		http.Error(w, warnMsg, http.StatusConflict)
+		helpers.WriteError(h.app.Logger, w, r, "warn", warnMsg, http.StatusConflict, err)
 		return
 	case err != nil:
-		h.app.Logger.Error("failed to create order", zap.String("source ip", r.RemoteAddr), zap.Error(err))
-		http.Error(w, "failed to create order", http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "failed to create order", http.StatusInternalServerError, err)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -84,22 +79,19 @@ func (h *OHandler) GetOrders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	claims, ok := middleware.GetUsernameFromCtx(ctx)
 	if !ok {
-		h.app.Logger.Error("cannot get username from the request's context", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "cannot get username from context", http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot get username from context", http.StatusInternalServerError, nil)
 		return
 	}
 	user := models.Users{ID: claims.ID, Login: claims.Username}
 	orders, err := h.srv.GetOrders(ctx, &user)
 
 	if err != nil {
-		h.app.Logger.Error("cannot get orders", zap.String("source ip", r.RemoteAddr), zap.Error(err))
 		errMsg := "cannot get orders"
-		http.Error(w, errMsg, http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", errMsg, http.StatusInternalServerError, err)
 		return
 	}
 	if len(orders) == 0 {
 		h.app.Logger.Info("no orders found", zap.String("source ip", r.RemoteAddr))
-		//errMsg := "no orders found"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -116,9 +108,8 @@ func (h *OHandler) GetOrders(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := json.Marshal(orderResponses)
 	if err != nil {
-		h.app.Logger.Error("cannot marshal orders", zap.String("source ip", r.RemoteAddr), zap.Error(err))
 		errMsg := "cannot get orders"
-		http.Error(w, errMsg, http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", errMsg, http.StatusInternalServerError, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

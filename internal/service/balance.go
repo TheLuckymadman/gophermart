@@ -9,10 +9,10 @@ import (
 
 type BalanceService struct {
 	app *app.App
-	db  Storage
+	db  BalanceStorage
 }
 
-func NewBalanceService(app *app.App, db Storage) *BalanceService {
+func NewBalanceService(app *app.App, db BalanceStorage) *BalanceService {
 	return &BalanceService{app: app, db: db}
 }
 

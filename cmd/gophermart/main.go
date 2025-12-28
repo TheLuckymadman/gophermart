@@ -8,11 +8,11 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"sync"
 	"syscall"
 	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/TheLuckymadman/gophermart/internal/app"
 	"github.com/TheLuckymadman/gophermart/internal/config"
@@ -32,75 +32,72 @@ func run() error {
 	logger.Info("server is starting")
 	cfg := config.Load()
 	app := app.NewApp(logger, cfg.Key, cfg.TokenExpTime)
-	db, err := repository.NewPGDB(app, cfg.DatabaseURI, cfg.DBInitMode)
+	storage, err := repository.NewStorage(app, cfg.DatabaseURI, cfg.DBInitMode)
 	if err != nil {
 		return fmt.Errorf("%w", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
-	workerSvc := service.NewAccrualWorker(app, db)
+	workerSvc := service.NewAccrualWorker(app, storage.OrderRepo)
 	ordersCh := make(chan models.Order, cfg.RateLimit)
-	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		workerSvc.OrderScheduler(ctx, 1, ordersCh, cfg.DBReqFrequency, cfg.RateLimit)
-	}()
+	g, ctx := errgroup.WithContext(signalCtx)
+	g.Go(func() error {
+		return workerSvc.OrderScheduler(ctx, 1, ordersCh, cfg.DBReqFrequency, cfg.RateLimit)
+	})
 
-	for id := range cfg.RateLimit {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			workerSvc.OrderProcessor(ctx, id, ordersCh, cfg.AccrualSystemAddress)
-		}(id)
+	for id := 0; id < cfg.RateLimit; id++ {
+		id := id
+		g.Go(func() error {
+			return workerSvc.OrderProcessor(ctx, id, ordersCh, cfg.AccrualSystemAddress)
+		})
 	}
 
-	userSvc := service.NewUserService(app, db)
-	orderSvc := service.NewOrderService(app, db)
-	balanceSvc := service.NewBalanceService(app, db)
+	userSvc := service.NewUserService(app, storage.UserRepo)
+	orderSvc := service.NewOrderService(app, storage.OrderRepo)
+	balanceSvc := service.NewBalanceService(app, storage.BalanceRepo)
 	mux := mux.NewMux(app, userSvc, orderSvc, balanceSvc)
 	srv := http.Server{
 		Addr:    cfg.RunAddress,
 		Handler: mux,
 	}
 
-	serverErrCh := make(chan error)
-	go func() {
+	g.Go(func() error {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			serverErrCh <- err
-			stop()
+			return err
 		}
-	}()
+		return nil
+	})
 
 	logger.Info("server started",
 		zap.String("interface", cfg.RunAddress),
 		zap.Any("db init mode", cfg.DBInitMode),
 	)
 
-	select {
-	case err := <-serverErrCh:
-		logger.Error("http server error", zap.Error(err))
-	case <-ctx.Done():
-		{
-			logger.Info("shutdown signal received, the system is shutting down...")
-			logger.Info("waiting for workers to shutdown gracefully")
-			wg.Wait()
-			logger.Info("workers shutdown gracefully")
+	g.Go(func() error {
+		<-ctx.Done()
 
-			shutdownCtx, stop := context.WithTimeout(ctx, time.Second*5)
-			defer stop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-			logger.Info("trying to stop http server")
-			if err := srv.Shutdown(shutdownCtx); err != nil {
-				_ = srv.Close()
-				return err
-			}
-			logger.Info("server stopped gracefully", zap.Int("goroutines left", runtime.NumGoroutine()))
-		}
+		logger.Info("shutting down http server")
+		return srv.Shutdown(shutdownCtx)
+	})
+
+	g.Go(func() error {
+		<-ctx.Done()
+		close(ordersCh)
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		logger.Error("unrecoverable error occured", zap.Error(err))
+		return err
 	}
+	logger.Info("server stopped gracefully", zap.Int("goroutines left", runtime.NumGoroutine()))
+
 	return nil
 }
 

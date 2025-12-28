@@ -16,14 +16,14 @@ import (
 
 type AccrualWorker struct {
 	app *app.App
-	db  Storage
+	db  OrderUpdateStorage
 }
 
-func NewAccrualWorker(a *app.App, db Storage) *AccrualWorker {
+func NewAccrualWorker(a *app.App, db OrderUpdateStorage) *AccrualWorker {
 	return &AccrualWorker{app: a, db: db}
 }
 
-func (w *AccrualWorker) OrderScheduler(ctx context.Context, workerID int, ch chan<- models.Order, interval int, maxOrdersCnt int) {
+func (w *AccrualWorker) OrderScheduler(ctx context.Context, workerID int, ch chan<- models.Order, interval int, maxOrdersCnt int) error {
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 	reqAccStatuses := []string{
@@ -33,7 +33,7 @@ func (w *AccrualWorker) OrderScheduler(ctx context.Context, workerID int, ch cha
 		models.OrderAccrualStatusReqFailed,
 		models.OrderAccrualStatusNotRegistred,
 	}
-	f := func() {
+	f := func() error {
 		orders, err := w.db.ListOrdersToEnqueue(
 			ctx,
 			reqAccStatuses,
@@ -43,46 +43,54 @@ func (w *AccrualWorker) OrderScheduler(ctx context.Context, workerID int, ch cha
 		)
 		if err != nil {
 			w.app.Logger.Error("getting orders error", zap.Int("worker id", workerID), zap.Error(err))
-			return
+			return err
 		}
 
-		sent := make(map[int]bool)
-		for _, order := range orders {
+		errDetected := false
+		for i, order := range orders {
 			select {
 			case ch <- order:
-				sent[order.ID] = true
 			case <-ctx.Done():
-				for _, o := range orders {
-					if !sent[o.ID] {
-						err = w.db.UpdOrderTmpStatus(ctx, o.Number, o.AccrualStatus, models.OrderStatusProcessing)
-						if err != nil {
-							w.app.Logger.Error("update orders error", zap.Int("worker id", workerID), zap.Error(err))
-							continue
-						}
+				for _, o := range orders[i:] {
+					rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					err = w.db.UpdOrderTmpStatus(rollbackCtx, o.Number, o.AccrualStatus, models.OrderStatusProcessing)
+					if err != nil {
+						w.app.Logger.Error("update orders error", zap.Int("worker id", workerID), zap.Error(err))
+						errDetected = true
+						continue
 					}
 				}
-				return
+				if errDetected {
+					return fmt.Errorf("update orders error, see errors above")
+				}
+				return nil
 			}
 		}
+		return nil
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
-			f()
+			if err := f(); err != nil {
+				return err
+			}
 		}
 	}
 }
 
-func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-chan models.Order, accrualAddr string) {
-	client := &http.Client{}
-	f := func(order models.Order) {
+func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-chan models.Order, accrualAddr string) error {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+	f := func(order models.Order) error {
 		err := w.db.UpdOrderTmpStatus(ctx, order.Number, models.OrderAccrualStatusChecking, models.OrderStatusProcessing)
 		if err != nil {
 			w.app.Logger.Error("update orders error", zap.Int("worker id", workerID), zap.Error(err))
-			return
+			return err
 		}
 
 		url := fmt.Sprintf("%s/api/orders/%s", accrualAddr, order.Number)
@@ -92,8 +100,9 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 			err = w.db.UpdOrderTmpStatus(ctx, order.Number, models.OrderAccrualStatusReqFailed, models.OrderStatusProcessing)
 			if err != nil {
 				w.app.Logger.Error("update orders error", zap.Int("worker id", workerID), zap.Error(err))
+				return err
 			}
-			return
+			return nil
 		}
 		w.app.Logger.Info("request to accrual", zap.String("request", url))
 		resp, err := client.Do(req)
@@ -102,8 +111,9 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 			err = w.db.UpdOrderTmpStatus(ctx, order.Number, models.OrderAccrualStatusReqFailed, models.OrderStatusProcessing)
 			if err != nil {
 				w.app.Logger.Error("update orders error", zap.Int("worker id", workerID), zap.Error(err))
+				return err
 			}
-			return
+			return nil
 		}
 		defer resp.Body.Close()
 
@@ -119,8 +129,9 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 			err = w.db.UpdOrderTmpStatus(ctx, order.Number, accrualStatus, models.OrderStatusProcessing)
 			if err != nil {
 				w.app.Logger.Error("update orders error", zap.Int("worker id", workerID), zap.Error(err))
+				return err
 			}
-			return
+			return nil
 		case http.StatusTooManyRequests:
 			accrualStatus = models.OrderAccrualStatusReqFailed
 			httpErrResp = true
@@ -139,8 +150,9 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 			err = w.db.UpdOrderTmpStatus(ctx, order.Number, accrualStatus, models.OrderStatusProcessing)
 			if err != nil {
 				w.app.Logger.Error("update orders error", zap.Int("worker id", workerID), zap.Error(err))
+				return err
 			}
-			return
+			return nil
 		}
 
 		body, err := io.ReadAll(resp.Body)
@@ -149,8 +161,9 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 			err = w.db.UpdOrderTmpStatus(ctx, order.Number, models.OrderAccrualStatusReqFailed, models.OrderStatusProcessing)
 			if err != nil {
 				w.app.Logger.Error("update orders error", zap.Int("worker id", workerID), zap.Error(err))
+				return err
 			}
-			return
+			return nil
 		}
 		w.app.Logger.Info("response from accrual", zap.String("response", string(body)))
 
@@ -161,8 +174,9 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 			err = w.db.UpdOrderTmpStatus(ctx, order.Number, models.OrderAccrualStatusReqFailed, models.OrderStatusProcessing)
 			if err != nil {
 				w.app.Logger.Error("update order error", zap.Int("worker id", workerID), zap.Error(err))
+				return err
 			}
-			return
+			return nil
 		}
 		w.app.Logger.Info("response from accrual", zap.Any("paylod", accrualRespOrder))
 
@@ -178,7 +192,7 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 			if err != nil {
 				w.app.Logger.Error("update order error", zap.Int("worker id", workerID), zap.Error(err))
 			} else {
-				return
+				return nil
 			}
 		} else if accrualRespOrder.Status == models.OrderAccrualStatusProcessed ||
 			accrualRespOrder.Status == models.OrderAccrualStatusInvalid {
@@ -186,14 +200,14 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 			if err != nil {
 				w.app.Logger.Error("update order error", zap.Int("worker id", workerID), zap.Error(err))
 			} else {
-				return
+				return nil
 			}
 		} else {
 			err = w.db.UpdOrderTmpStatus(ctx, order.Number, accrualRespOrder.Status, models.OrderStatusProcessing)
 			if err != nil {
 				w.app.Logger.Error("update order error", zap.Int("worker id", workerID), zap.Error(err))
 			} else {
-				return
+				return nil
 			}
 		}
 		w.app.Logger.Error("update order error", zap.Int("worker id", workerID), zap.Error(err))
@@ -201,18 +215,20 @@ func (w *AccrualWorker) OrderProcessor(ctx context.Context, workerID int, ch <-c
 		if err != nil {
 			w.app.Logger.Error("update order error", zap.Int("worker id", workerID), zap.Error(err))
 		}
+		return fmt.Errorf("orderProcessor error occured, see errors above")
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case order, ok := <-ch:
 			if !ok {
-				w.app.Logger.Error("channel returned not ok", zap.Int("worker id", workerID))
-				continue
+				return nil
 			}
-			f(order)
+			if err := f(order); err != nil {
+				return err
+			}
 		}
 	}
 }

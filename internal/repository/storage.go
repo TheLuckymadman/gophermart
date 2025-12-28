@@ -17,6 +17,61 @@ import (
 	"github.com/TheLuckymadman/gophermart/internal/app"
 )
 
+type Storage struct {
+	DB          *sql.DB
+	App         *app.App
+	UserRepo    *UserRepo
+	OrderRepo   *OrderRepo
+	BalanceRepo *BalanceRepo
+}
+
+func NewStorage(
+	app *app.App,
+	dsn string,
+	mode DBInitMode,
+) (*Storage, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open DB: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping DB: %w", err)
+	}
+
+	switch mode {
+	case ExtManaged:
+		log.Println("External managed DB is chosen")
+	case IntManagedForce:
+		log.Println("Internal managed DB is chosen with recreating DB entities")
+		err := RunMigration(db, "migrations", DOWN)
+		if err != nil {
+			return nil, fmt.Errorf("init DB status %w", err)
+		}
+		err = RunMigration(db, "migrations", UP)
+		if err != nil {
+			return nil, fmt.Errorf("init DB status %w", err)
+		}
+	case IntManaged:
+		log.Println("Internal managed DB is chosen, with creating DB entities if they don't exist")
+		err := RunMigration(db, "migrations", UP)
+		if err != nil {
+			return nil, fmt.Errorf("init DB status %w", err)
+		}
+	default:
+		log.Println("Wrong mode, use external managed DB as default")
+	}
+
+	userRepo := NewUserRepo(db, app)
+	orderRepo, err := NewOrderRepo(db, app)
+	if err != nil {
+		return nil, err
+	}
+	balanceRepo := NewBalanceRepo(db, app)
+	storage := Storage{DB: db, App: app, UserRepo: userRepo, OrderRepo: orderRepo, BalanceRepo: balanceRepo}
+
+	return &storage, nil
+}
+
 type DBInitMode int
 
 func (m *DBInitMode) UnmarshalText(text []byte) error {
@@ -51,11 +106,6 @@ const (
 	IntManagedForce
 )
 
-type PGStorage struct {
-	DB  *sql.DB
-	app *app.App
-}
-
 type MigrationCMD int
 
 const (
@@ -63,48 +113,8 @@ const (
 	DOWN
 )
 
-func NewPGDB(a *app.App, dsn string, mode DBInitMode) (*PGStorage, error) {
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open DB: %w", err)
-	}
-	storage := PGStorage{DB: db, app: a}
-	switch mode {
-	case ExtManaged:
-		log.Println("External managed DB is chosen")
-	case IntManagedForce:
-		log.Println("Internal managed DB is chosen with recreating DB entities")
-		err := storage.RunMigration("migrations", DOWN)
-		if err != nil {
-			return nil, fmt.Errorf("init DB status %w", err)
-		}
-		err = storage.RunMigration("migrations", UP)
-		if err != nil {
-			return nil, fmt.Errorf("init DB status %w", err)
-		}
-	case IntManaged:
-		log.Println("Internal managed DB is chosen, with creating DB entities if they don't exist")
-		err := storage.RunMigration("migrations", UP)
-		if err != nil {
-			return nil, fmt.Errorf("init DB status %w", err)
-		}
-	default:
-		log.Println("Wrong mode, use external managed DB as default")
-	}
-
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping DB: %w", err)
-	}
-
-	if err := storage.ResetProcessingOrdersRetry(context.Background()); err != nil {
-		return nil, fmt.Errorf("cannot reset order retries: %w", err)
-	}
-
-	return &storage, nil
-}
-
-func (p *PGStorage) RunMigration(migrationsDir string, cmd MigrationCMD) error {
-	driver, err := postgres.WithInstance(p.DB, &postgres.Config{})
+func RunMigration(db *sql.DB, migrationsDir string, cmd MigrationCMD) error {
+	driver, err := postgres.WithInstance(db, &postgres.Config{})
 	if err != nil {
 		return fmt.Errorf("migrate: open driver: %w", err)
 	}
@@ -133,7 +143,7 @@ func (p *PGStorage) RunMigration(migrationsDir string, cmd MigrationCMD) error {
 			return err
 		}
 		if d {
-			log.Printf("DB is a dirty state\n")
+			log.Printf("DB is in a dirty state\n")
 			err = m.Force(int(v))
 			if err != nil {
 				return err
@@ -165,11 +175,11 @@ func (p *PGStorage) RunMigration(migrationsDir string, cmd MigrationCMD) error {
 	return nil
 }
 
-func (p *PGStorage) Close() error {
+func (p *Storage) Close() error {
 	return p.DB.Close()
 }
 
-func (p *PGStorage) PingDB(ctx context.Context) error {
+func (p *Storage) PingDB(ctx context.Context) error {
 	type result struct{}
 	f := func() (result, error) {
 		return result{}, p.DB.PingContext(ctx)

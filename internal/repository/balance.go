@@ -6,12 +6,23 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/TheLuckymadman/gophermart/internal/app"
 	"github.com/TheLuckymadman/gophermart/internal/apperrors"
 	"github.com/TheLuckymadman/gophermart/internal/models"
 )
 
-func (p *PGStorage) GetBalance(ctx context.Context, userID int) (int64, int64, error) {
-	row := p.DB.QueryRowContext(ctx, `
+type BalanceRepo struct {
+	db  *sql.DB
+	app *app.App
+	*BaseRepo[struct{}]
+}
+
+func NewBalanceRepo(db *sql.DB, app *app.App) *BalanceRepo {
+	return &BalanceRepo{db: db, app: app, BaseRepo: NewBaseRepo[struct{}](db)}
+}
+
+func (r *BalanceRepo) GetBalance(ctx context.Context, userID int) (int64, int64, error) {
+	row := r.db.QueryRowContext(ctx, `
 		SELECT balance, withdrawn
 		FROM users
 		WHERE id = $1
@@ -30,69 +41,63 @@ func (p *PGStorage) GetBalance(ctx context.Context, userID int) (int64, int64, e
 	return balance, withdrawn, nil
 }
 
-func (p *PGStorage) Withdraw(ctx context.Context, userID int, amount int64, number string) (err error) {
-	tx, err := p.DB.BeginTx(ctx, nil)
-	if err != nil {
-		err = fmt.Errorf("tx creation on withdrawing: %w", err)
-		return
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		} else {
-			err = tx.Commit()
-		}
-	}()
-	row := tx.QueryRowContext(ctx, `
+func (r *BalanceRepo) Withdraw(ctx context.Context, userID int, amount int64, number string) (err error) {
+	fn := func(tx *sql.Tx) (struct{}, error) {
+		row := tx.QueryRowContext(ctx, `
 		SELECT balance
 		FROM users
 		WHERE id = $1
 		FOR UPDATE
-	`, userID)
+		`, userID)
 
-	var balance int64
-	if err = row.Scan(&balance); err != nil {
-		err = fmt.Errorf("select for update users on withdrawing: %w", err)
-		return
+		var balance int64
+		if err = row.Scan(&balance); err != nil {
+			err = fmt.Errorf("select for update users on withdrawing: %w", err)
+			return struct{}{}, err
+		}
+		newBalance := balance - amount
+		if newBalance < 0 {
+			err = apperrors.ErrInsufficientFunds
+			return struct{}{}, err
+		}
+		var withdrawalID int
+		err = tx.QueryRowContext(ctx, `
+			INSERT INTO withdrawals (number, withdrawn, user_id)
+			VALUES ($1, $2, $3)	
+			RETURNING id
+		`, number, amount, userID).Scan(&withdrawalID)
+		if err != nil {
+			err = fmt.Errorf("insert into withdrawals on withdrawing: %w", err)
+			return struct{}{}, err
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO operations (type, amount, user_id, withdrawal_id)
+			VALUES ($1, $2, $3, $4)
+		`, models.OperTypeWithdrawal, amount, userID, withdrawalID)
+		if err != nil {
+			err = fmt.Errorf("insert into operations on withdrawing: %w", err)
+			return struct{}{}, err
+		}
+		_, err = tx.ExecContext(ctx, `
+			UPDATE users
+			SET balance = $1, 
+				withdrawn = withdrawn + $2
+			WHERE id = $3
+		`, newBalance, amount, userID)
+		if err != nil {
+			err = fmt.Errorf("update users on withdrawing: %w", err)
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
 	}
-	newBalance := balance - amount
-	if newBalance < 0 {
-		err = apperrors.ErrInsufficientFunds
-		return
-	}
-	var withdrawalID int
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO withdrawals (number, withdrawn, user_id)
-		VALUES ($1, $2, $3)	
-		RETURNING id
-	`, number, amount, userID).Scan(&withdrawalID)
-	if err != nil {
-		err = fmt.Errorf("insert into withdrawals on withdrawing: %w", err)
-		return
-	}
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO operations (type, amount, user_id, withdrawal_id)
-		VALUES ($1, $2, $3, $4)
-	`, models.OperTypeWithdrawal, amount, userID, withdrawalID)
-	if err != nil {
-		err = fmt.Errorf("insert into operations on withdrawing: %w", err)
-		return
-	}
-	_, err = tx.ExecContext(ctx, `
-		UPDATE users
-		SET balance = $1, 
-			withdrawn = withdrawn + $2
-		WHERE id = $3
-	`, newBalance, amount, userID)
-	if err != nil {
-		err = fmt.Errorf("update users on withdrawing: %w", err)
-		return
-	}
-	return
+
+	_, err = r.withTx(ctx, fn)
+
+	return err
 }
 
-func (p *PGStorage) ListWithdrawals(ctx context.Context, userID int) ([]models.WithdrawalInternal, error) {
-	rows, err := p.DB.QueryContext(ctx, `
+func (r *BalanceRepo) ListWithdrawals(ctx context.Context, userID int) ([]models.WithdrawalInternal, error) {
+	rows, err := r.db.QueryContext(ctx, `
 		SELECT number, withdrawn, created_at
 		FROM withdrawals
 		WHERE user_id = $1 

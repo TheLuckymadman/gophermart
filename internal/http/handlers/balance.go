@@ -9,6 +9,7 @@ import (
 
 	"github.com/TheLuckymadman/gophermart/internal/app"
 	"github.com/TheLuckymadman/gophermart/internal/apperrors"
+	"github.com/TheLuckymadman/gophermart/internal/http/helpers"
 	"github.com/TheLuckymadman/gophermart/internal/http/middleware"
 	"github.com/TheLuckymadman/gophermart/internal/models"
 	"github.com/TheLuckymadman/gophermart/internal/utils"
@@ -30,24 +31,19 @@ func (h *BHandler) GetBalance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	claims, ok := middleware.GetUsernameFromCtx(ctx)
 	if !ok {
-		h.app.Logger.Error("cannot get username from the request's context", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "cannot get username from context", http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot get username from context", http.StatusInternalServerError, nil)
 		return
 	}
 	user := models.Users{ID: claims.ID, Login: claims.Username}
 	balance, withdrawn, err := h.srv.GetBalance(ctx, &user)
 	if err != nil {
-		h.app.Logger.Error("cannot get balance", zap.String("source ip", r.RemoteAddr), zap.Error(err))
-		errMsg := "cannot get balance"
-		http.Error(w, errMsg, http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot get balance", http.StatusInternalServerError, err)
 		return
 	}
 	payload := models.Balance{Current: utils.ConvertFromCents(balance), Withdrawn: utils.ConvertFromCents(withdrawn)}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		h.app.Logger.Error("cannot marshal balance", zap.String("source ip", r.RemoteAddr), zap.Error(err))
-		errMsg := "cannot get balance"
-		http.Error(w, errMsg, http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot get balance", http.StatusInternalServerError, err)
 		return
 	}
 
@@ -64,27 +60,23 @@ func (h *BHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	claims, ok := middleware.GetUsernameFromCtx(ctx)
 	if !ok {
-		h.app.Logger.Error("cannot get username from the request's context", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "cannot get username from context", http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot get username from context", http.StatusInternalServerError, nil)
 		return
 	}
 	if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
-		h.app.Logger.Warn("wrong content type", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "wrong content type, use application/json", http.StatusBadRequest)
+		helpers.WriteError(h.app.Logger, w, r, "warn", "wrong content type, use application/json", http.StatusBadRequest, nil)
 		return
 	}
 	var wr models.WithdrawalResponse
 	err := json.NewDecoder(r.Body).Decode(&wr)
 	if err != nil {
-		h.app.Logger.Warn("decode body", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "cannot read body with withdrawal amount", http.StatusBadRequest)
+		helpers.WriteError(h.app.Logger, w, r, "warn", "cannot read body with withdrawal amount", http.StatusBadRequest, err)
 		return
 	}
-	ok, err = utils.CheckNumber(wr.Number)
+	ok, err = helpers.CheckNumber(wr.Number)
 	if !ok {
-		h.app.Logger.Warn("incorrect order number", zap.String("source ip", r.RemoteAddr))
 		errMsg := fmt.Sprintf("incorrect order number: %v", err)
-		http.Error(w, errMsg, http.StatusUnprocessableEntity)
+		helpers.WriteError(h.app.Logger, w, r, "warn", errMsg, http.StatusUnprocessableEntity, err)
 		return
 	}
 	wi := models.WithdrawalInternal{Number: wr.Number, AmountCents: utils.ConvertToCents(wr.Amount)}
@@ -93,12 +85,10 @@ func (h *BHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
 	err = h.srv.Withdraw(ctx, &user, wi)
 	switch {
 	case errors.Is(err, apperrors.ErrInsufficientFunds):
-		h.app.Logger.Warn("insufficient funds", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "insufficient funds", http.StatusPaymentRequired)
+		helpers.WriteError(h.app.Logger, w, r, "warn", "insufficient funds", http.StatusPaymentRequired, err)
 		return
 	case err != nil:
-		h.app.Logger.Error("cannot withdraw", zap.String("source ip", r.RemoteAddr), zap.Error(err))
-		http.Error(w, "cannot withdraw", http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot withdraw", http.StatusInternalServerError, err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -109,8 +99,7 @@ func (h *BHandler) Getwithdrawals(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	claims, ok := middleware.GetUsernameFromCtx(ctx)
 	if !ok {
-		h.app.Logger.Error("cannot get username from the request's context", zap.String("source ip", r.RemoteAddr))
-		http.Error(w, "cannot get username from context", http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot get username from context", http.StatusInternalServerError, nil)
 		return
 	}
 	user := models.Users{ID: claims.ID, Login: claims.Username}
@@ -123,16 +112,13 @@ func (h *BHandler) Getwithdrawals(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 	if err != nil {
-		h.app.Logger.Error("cannot get withdrawals", zap.String("source ip", r.RemoteAddr), zap.Error(err))
-		http.Error(w, "cannot get withdrawals", http.StatusInternalServerError)
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot get withdrawals", http.StatusInternalServerError, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	err = json.NewEncoder(w).Encode(withdrawalResponses)
-	if err != nil {
-		h.app.Logger.Error("cannot encode http body", zap.String("source ip", r.RemoteAddr), zap.Error(err))
-		http.Error(w, "cannot get withdrawals", http.StatusInternalServerError)
+	if err = json.NewEncoder(w).Encode(withdrawalResponses); err != nil {
+		helpers.WriteError(h.app.Logger, w, r, "error", "cannot get withdrawals", http.StatusInternalServerError, err)
 		return
 	}
 }
